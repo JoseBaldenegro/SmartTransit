@@ -1,0 +1,229 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <TinyGPSPlus.h>
+#include <FS.h>        
+#include <LittleFS.h>   
+
+// ---------------- DATOS DE LA UNIDAD ----------------
+#define ID_UNIDAD "012"            
+#define RUTA_UNIDAD "Universitaria"   
+#define COLOR_UNIDAD "Camión morado"   
+
+// ---------------- WIFI ----------------
+const char* ssid = "******************";
+const char* password = "**************";
+
+// ---------------- GPS (UART2) ----------------
+#define GPS_RX 16
+#define GPS_TX 17
+HardwareSerial gpsSerial(2);
+TinyGPSPlus gps;
+
+// ---------------- ESP32-CAM (UART1) ----------------
+#define CAM_RX 4
+HardwareSerial camSerial(1);
+
+// ---------------- SIM800L ----------------
+#define SIM_TX 26
+#define SIM_RX 27
+
+// -------- FIREBASE --------
+#define API_KEY "**************"
+#define USER_EMAIL "*************"
+#define USER_PASSWORD "*************"
+#define DATABASE_URL "********************"
+
+// Objetos Firebase
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+int rostrosDetectados = 0;
+unsigned long lastSend = 0;
+
+// ---------------- ARCHIVO OFFLINE ----------------
+const char* ARCHIVO_OFFLINE = "/offline.csv"; 
+
+// ---------------- LEER CAM ----------------
+void leerCamara() {
+    static String buffer = "";
+    while (camSerial.available()) {
+        char c = camSerial.read();
+        if (c == '\n') {
+            if (buffer.startsWith("FACES:")) {
+                rostrosDetectados = buffer.substring(6).toInt();
+                Serial.print("Rostros detectados: ");
+                Serial.println(rostrosDetectados);
+            }
+            buffer = "";
+        } else {
+            buffer += c;
+        }
+    }
+}
+
+// ---------------- FIREBASE ----------------
+void setupFirebase() {
+    config.api_key = API_KEY;
+    config.database_url = DATABASE_URL;
+
+    auth.user.email = USER_EMAIL;
+    auth.user.password = USER_PASSWORD;
+
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+}
+
+// ---------------- ALMACENAMIENTO OFFLINE (LITTLEFS) ----------------
+void guardarOffline(float lat, float lng, float vel, int rostros) {
+    File file = LittleFS.open(ARCHIVO_OFFLINE, FILE_APPEND);
+    if (!file) {
+        Serial.println("Error abriendo archivo LittleFS");
+        return;
+    }
+    file.printf("%f,%f,%f,%d\n", lat, lng, vel, rostros);
+    file.close();
+    Serial.println("Datos resguardados en caché local.");
+}
+
+void sincronizarOffline() {
+    if (!LittleFS.exists(ARCHIVO_OFFLINE)) return;
+
+    File file = LittleFS.open(ARCHIVO_OFFLINE, FILE_READ);
+    if (!file || file.size() == 0) return;
+
+    Serial.println("Recuperando paquetes atrasados...");
+    String remaining = "";
+
+    while (file.available()) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        
+        if (line.length() > 0 && WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+            int f1 = line.indexOf(',');
+            int f2 = line.indexOf(',', f1 + 1);
+            int f3 = line.indexOf(',', f2 + 1);
+
+            if (f1 > 0 && f2 > 0 && f3 > 0) {
+                float lat = line.substring(0, f1).toFloat();
+                float lng = line.substring(f1 + 1, f2).toFloat();
+                float vel = line.substring(f2 + 1, f3).toFloat();
+                int ros = line.substring(f3 + 1).toInt();
+
+                FirebaseJson json;
+                json.set("lat", lat);
+                json.set("lng", lng);
+                json.set("vel", vel);
+                json.set("rostros", ros);
+                json.set("ruta", RUTA_UNIDAD);
+                json.set("color", COLOR_UNIDAD);
+                json.set("tipo_envio", "recuperado_cache");
+
+                String path = "/unidades/" + String(ID_UNIDAD);
+                if(Firebase.RTDB.setJSON(&fbdo, path.c_str(), &json)) {
+                    Serial.println("Paquete atrasado enviado OK.");
+                } else {
+                    remaining += line + "\n";
+                }
+                delay(500); 
+            }
+        } else if (line.length() > 0) {
+            remaining += line + "\n";
+        }
+    }
+    file.close();
+
+    LittleFS.remove(ARCHIVO_OFFLINE);
+    if (remaining.length() > 0) {
+        File temp = LittleFS.open(ARCHIVO_OFFLINE, FILE_WRITE);
+        temp.print(remaining);
+        temp.close();
+    } else {
+        Serial.println("Caché vaciada al 100%.");
+    }
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("\n\n--- INICIANDO SISTEMA ---");
+
+    // Montar memoria LittleFS
+    if (!LittleFS.begin(true)) {
+        Serial.println("Error montando LittleFS");
+    } else {
+        Serial.println("LittleFS montado OK");
+    }
+
+    gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+    camSerial.begin(115200, SERIAL_8N1, CAM_RX, -1);
+
+    Serial.print("Buscando red Wi-Fi: ");
+    Serial.println(ssid);
+    
+    WiFi.begin(ssid, password);
+    
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println("\n¡Wi-Fi Conectado exitosamente!");
+    Serial.print("Dirección IP asignada: ");
+    Serial.println(WiFi.localIP());
+
+    Serial.println("Configurando Firebase...");
+    setupFirebase();
+    Serial.println("¡Firebase listo!\n");
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+
+    while (gpsSerial.available()) {
+        gps.encode(gpsSerial.read());
+    }
+
+    leerCamara();
+
+    if (millis() - lastSend > 30000) {
+        enviarDatos();
+        lastSend = millis();
+    }
+}
+
+// ---------------- ENVIAR ----------------
+void enviarDatos() {
+    Serial.println("Intentando enviar datos...");
+
+    float lat = gps.location.isValid() ? gps.location.lat() : 0.0;
+    float lng = gps.location.isValid() ? gps.location.lng() : 0.0;
+    float vel = gps.location.isValid() ? gps.speed.kmph() : 0.0;
+
+    FirebaseJson json;
+    json.set("lat", lat);
+    json.set("lng", lng);
+    json.set("vel", vel);
+    json.set("rostros", rostrosDetectados);
+    json.set("ruta", RUTA_UNIDAD);
+    json.set("color", COLOR_UNIDAD);
+    
+    if (!gps.location.isValid()) {
+        json.set("error", "Sin señal GPS");
+    }
+
+    String firebasePath = String("/unidades/") + ID_UNIDAD;
+    
+    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+        if (Firebase.RTDB.setJSON(&fbdo, firebasePath.c_str(), &json)) {
+            sincronizarOffline(); 
+        } else {
+            Serial.println(fbdo.errorReason());
+            guardarOffline(lat, lng, vel, rostrosDetectados);
+        }
+    } else {
+        guardarOffline(lat, lng, vel, rostrosDetectados);
+    }
+}

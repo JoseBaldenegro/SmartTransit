@@ -1,0 +1,222 @@
+#include "esp_camera.h"
+#include "img_converters.h"
+#include "fd_forward.h"
+#include "camera_pins.h"
+#include "esp_heap_caps.h"
+
+#define SLEEP_US (30ULL * 1000000ULL)
+
+#define FRAME_SIZE FRAMESIZE_QQVGA
+#define XCLK_FREQ_HZ 20000000
+
+// ===== LEDs =====
+#define LED_FACE_DETECTED 12
+#define LED_DATA_SENT     13
+
+static mtmn_config_t buildMtmnConfig() {
+    mtmn_config_t cfg = {0};
+
+    cfg.type = FAST;
+
+    cfg.min_face = 40;
+
+    cfg.pyramid = 0.707f;
+    cfg.pyramid_times = 4;
+
+    cfg.p_threshold.score = 0.6f;
+    cfg.p_threshold.nms = 0.7f;
+    cfg.p_threshold.candidate_number = 20;
+
+    cfg.r_threshold.score = 0.7f;
+    cfg.r_threshold.nms = 0.7f;
+    cfg.r_threshold.candidate_number = 10;
+
+    cfg.o_threshold.score = 0.7f;
+    cfg.o_threshold.nms = 0.4f;
+    cfg.o_threshold.candidate_number = 1;
+
+    return cfg;
+}
+
+bool initCamera() {
+
+    camera_config_t config;
+
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+
+    config.pin_sscb_sda = SIOD_GPIO_NUM;
+    config.pin_sscb_scl = SIOC_GPIO_NUM;
+
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+
+    config.xclk_freq_hz = XCLK_FREQ_HZ;
+
+    // IMPORTANTE
+    config.pixel_format = PIXFORMAT_RGB565;
+
+    // MUY IMPORTANTE PARA FACE DETECT
+    config.frame_size = FRAME_SIZE;
+
+    config.jpeg_quality = 12;
+
+    // SOLO 1 BUFFER
+    config.fb_count = 1;
+
+    esp_err_t err = esp_camera_init(&config);
+
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed: 0x%x\n", err);
+        return false;
+    }
+
+    sensor_t *s = esp_camera_sensor_get();
+
+    // Ajustes recomendados
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+
+    return true;
+}
+
+int detectFaces(mtmn_config_t &mtmn) {
+
+    camera_fb_t *fb = esp_camera_fb_get();
+
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        return -1;
+    }
+
+    dl_matrix3du_t *img = dl_matrix3du_alloc(
+        1,
+        fb->width,
+        fb->height,
+        3
+    );
+
+    if (!img) {
+        Serial.println("dl_matrix3du_alloc failed");
+        esp_camera_fb_return(fb);
+        return -1;
+    }
+
+    bool converted = fmt2rgb888(
+        fb->buf,
+        fb->len,
+        fb->format,
+        img->item
+    );
+
+    esp_camera_fb_return(fb);
+
+    if (!converted) {
+        Serial.println("fmt2rgb888 failed");
+        dl_matrix3du_free(img);
+        return -1;
+    }
+
+    box_array_t *boxes = face_detect(img, &mtmn);
+
+    int count = 0;
+
+    if (boxes) {
+
+        count = boxes->len;
+
+        Serial.printf("Faces detected: %d\n", count);
+
+        free(boxes->score);
+        free(boxes->box);
+        free(boxes->landmark);
+        free(boxes);
+
+    } else {
+
+        Serial.println("No faces detected");
+    }
+
+    dl_matrix3du_free(img);
+
+    return count;
+}
+
+void goToSleep() {
+
+    esp_camera_deinit();
+
+    esp_sleep_enable_timer_wakeup(SLEEP_US);
+
+    esp_deep_sleep_start();
+}
+
+void setup() {
+
+    Serial.begin(115200);
+
+    pinMode(LED_FACE_DETECTED, OUTPUT);
+    pinMode(LED_DATA_SENT, OUTPUT);
+
+    digitalWrite(LED_FACE_DETECTED, LOW);
+    digitalWrite(LED_DATA_SENT, LOW);
+
+    Serial.println();
+    Serial.println("Booting...");
+
+    // VERIFICAR PSRAM
+    if (psramFound()) {
+        Serial.println("PSRAM OK");
+    } else {
+        Serial.println("PSRAM NOT FOUND");
+    }
+
+    if (!initCamera()) {
+
+        Serial.println("Camera init error");
+
+        delay(3000);
+
+        goToSleep();
+    }
+
+    mtmn_config_t mtmn = buildMtmnConfig();
+
+    int faces = detectFaces(mtmn);
+
+    if (faces > 0) {
+
+        digitalWrite(LED_FACE_DETECTED, HIGH);
+    }
+
+    Serial.printf("FACES:%d\n", faces);
+
+    digitalWrite(LED_DATA_SENT, HIGH);
+
+    delay(1000);
+
+    digitalWrite(LED_FACE_DETECTED, LOW);
+    digitalWrite(LED_DATA_SENT, LOW);
+
+    delay(200);
+
+    goToSleep();
+}
+
+void loop() {
+}
